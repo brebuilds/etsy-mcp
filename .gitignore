@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+.env
+tokens/
+*.tsbuildinfo
+.DS_Store
+*.swp
+*.swo
+*~
+~/.etsy-mcp/
+
