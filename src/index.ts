@@ -99,7 +99,7 @@ class EtsyMCPServer {
     }
 
     // Check if token needs refresh
-    if (shop.tokenExpiry && Date.now() >= shop.tokenExpiry - 60000) {
+    if (shop.tokenExpiry && this.tokenManager.isExpiredOrNeedsRefresh(shop.tokenExpiry)) {
       if (shop.refreshToken) {
         await this.refreshToken(shop);
       } else {
