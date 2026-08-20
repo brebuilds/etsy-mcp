@@ -1,20 +1,75 @@
 # Etsy MCP Server
 
-A Model Context Protocol (MCP) server for interacting with the Etsy API. Supports multiple shops with OAuth2 authentication.
+A [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI
+assistant (Claude, Cursor, or any MCP-compatible client) direct, tool-based access to
+the [Etsy Open API v3](https://developers.etsy.com/documentation/) — listing
+management, inventory/variations, orders and receipts, and shop configuration — across
+one or more Etsy shops. Authentication is handled with a hand-rolled OAuth2
+Authorization Code + PKCE flow and automatic token refresh, so the assistant can keep
+working across a session without the user re-authorizing by hand.
 
-## Features
+25 tools are exposed today (see the [tool table](#tools) below), covering everything
+from `list_listings` to inventory/variation management to order fulfillment.
 
-- 🔐 **OAuth2 Authentication** with PKCE for secure token management
-- 🏪 **Multi-Shop Support** - Manage multiple Etsy shops from a single MCP server
-- 📦 **Listing Management** - Create, list, and retrieve listings
-- 🛒 **Order Management** - View orders and receipts
-- 🔄 **Automatic Token Refresh** - Tokens are automatically refreshed when expired
+## Architecture
+
+**Three small modules, one job each:**
+
+| Module | Responsibility |
+|---|---|
+| `src/oauth-handler.ts` | PKCE generation, the Etsy authorization URL, and the authorization-code / refresh-token token exchanges |
+| `src/token-manager.ts` | Token-expiry logic — decides *when* a stored token needs refreshing |
+| `src/etsy-client.ts` | A thin wrapper over the Etsy REST API (listings, inventory, orders, shop sections, receipts) |
+| `src/index.ts` | The MCP server itself — declares the 25 tools, dispatches tool calls, and owns per-shop config/token storage |
+
+### OAuth2 + PKCE flow
+
+Etsy's OAuth implementation requires PKCE (Proof Key for Code Exchange, [RFC
+7636](https://www.rfc-editor.org/rfc/rfc7636)) even for confidential clients, and this
+server targets the out-of-band redirect (`urn:ietf:wg:oauth:2.0:oob`) so it works from a
+CLI/MCP context with no local callback server to run.
+
+1. **`oauth_authenticate`** — `OAuthHandler.getAuthorizationUrl()` generates a random
+   43-character `code_verifier` (`crypto.randomBytes(32)`, base64url-encoded), derives
+   the `code_challenge` as `base64url(SHA-256(code_verifier))`, and returns an
+   authorization URL carrying that challenge plus a random `state`. The verifier and
+   state are stashed on the shop's config entry (`pendingCodeVerifier` /
+   `pendingState`) so they survive the round trip to Etsy's consent screen and back.
+2. The user visits the URL, approves the app, and Etsy redirects to the OOB endpoint
+   with an authorization `code`.
+3. **`oauth_callback`** — the code, together with the *original* `code_verifier`, is
+   exchanged for an access token + refresh token via `OAuthHandler.exchangeCode()`.
+   Etsy verifies the verifier hashes to the challenge it was given in step 1, which is
+   what makes PKCE useful here: a code intercepted in transit is useless without the
+   verifier that only this process holds.
+4. Tokens (plus the computed expiry timestamp) are written to
+   `~/.etsy-mcp/shops.json`, one entry per configured shop.
+
+### Automatic token refresh
+
+Every tool call that talks to the Etsy API goes through `EtsyMCPServer.getClient()`,
+which checks `TokenManager.isExpiredOrNeedsRefresh()` before handing back a client. That
+check compares `Date.now()` against `tokenExpiry - 60s` — refreshing a little *before*
+actual expiry avoids a request landing right on the boundary and failing mid-flight. If
+refresh is needed and a refresh token is on hand, `OAuthHandler.refreshToken()` exchanges
+it for a new access/refresh token pair and the config is rewritten; if there's no refresh
+token, the tool call fails with a clear "please re-authenticate" error rather than a raw
+HTTP 401 from Etsy.
+
+### Multi-shop support
+
+Shop configuration, credentials, and tokens are keyed by a caller-chosen `shopId` and
+stored together in `~/.etsy-mcp/shops.json`. Every listing/order/inventory tool accepts
+an optional `shopId`; when omitted, it falls back to whichever shop was set via
+`set_default_shop`. Each shop keeps its own client credentials and token lifecycle, so
+authenticating one shop never touches another's tokens.
 
 ## Prerequisites
 
 - Node.js 18.0.0 or higher
-- npm or yarn
-- Etsy API credentials (Client ID and Client Secret) from [Etsy Developer Portal](https://www.etsy.com/developers/)
+- npm
+- Etsy API credentials (Client ID and Client Secret) from the
+  [Etsy Developer Portal](https://www.etsy.com/developers/)
 
 ## Installation
 
@@ -31,11 +86,28 @@ npm install
 npm run build
 ```
 
+## Tests
+
+38 [vitest](https://vitest.dev) unit tests, all passing, covering:
+
+- PKCE code-verifier/code-challenge generation (length, charset, RFC 7636 S256
+  correctness) and authorization-URL construction
+- Token-expiry boundary conditions in `TokenManager.isExpiredOrNeedsRefresh()`
+- Request-building in `EtsyClient` — shop-id resolution/caching, pagination defaults,
+  camelCase→snake_case body mapping, variation/price-override handling
+
+No real HTTP requests are made — `axios` is mocked at the module boundary. Run them
+with:
+
+```bash
+npm test
+```
+
 ## Configuration
 
 ### Setting Up Etsy API Credentials
 
-1. Go to [Etsy Developer Portal](https://www.etsy.com/developers/)
+1. Go to the [Etsy Developer Portal](https://www.etsy.com/developers/)
 2. Create a new app or use an existing one
 3. Note your **Client ID** and **Client Secret**
 4. Set the redirect URI to `urn:ietf:wg:oauth:2.0:oob` (for out-of-band OAuth)
@@ -49,8 +121,8 @@ Use the MCP tools to add shops:
    add_shop({
      shopId: "my-shop-1",
      shopName: "My First Shop",
-     clientId: "your-client-id",
-     clientSecret: "your-client-secret"
+     clientId: "YOUR_CLIENT_ID",
+     clientSecret: "YOUR_CLIENT_SECRET"
    })
    ```
 
@@ -79,44 +151,52 @@ You can add multiple shops by repeating the process above with different `shopId
 
 **Note:** Etsy requires each shop to be associated with a unique Etsy account and email address. You'll need separate API credentials for each shop if they're on different accounts.
 
-## Usage
+## Tools
 
-### Available Tools
+### Shop Management
+| Tool | Description |
+|---|---|
+| `list_shops` | List all configured shops |
+| `add_shop` | Add a new shop configuration |
+| `oauth_authenticate` | Start OAuth2 authentication flow for a shop; returns an authorization URL |
+| `oauth_callback` | Complete OAuth2 authentication with the authorization code |
+| `set_default_shop` | Set the default shop used when `shopId` is omitted |
 
-#### Shop Management
-- `list_shops` - List all configured shops
-- `add_shop` - Add a new shop configuration
-- `set_default_shop` - Set the default shop
-- `oauth_authenticate` - Start OAuth flow
-- `oauth_callback` - Complete OAuth authentication
+### Shop Information
+| Tool | Description |
+|---|---|
+| `get_shop_info` | Get information about a shop |
 
-#### Shop Information
-- `get_shop_info` - Get information about a shop
+### Listings
+| Tool | Description |
+|---|---|
+| `list_listings` | List all active listings for a shop |
+| `list_draft_listings` | List all draft listings for a shop |
+| `get_listing` | Get details for a specific listing |
+| `create_listing` | Create a new listing with optional custom variations (up to 2), starts as draft |
+| `update_listing` | Update title, description, price, quantity, tags, materials, state, etc. |
+| `publish_listing` | Publish a draft listing (state → active) |
+| `deactivate_listing` | Deactivate a listing (state → inactive) |
+| `delete_listing` | Delete a listing permanently |
+| `get_listing_inventory` | Get inventory details, including variations/products |
+| `update_listing_inventory` | Update inventory with variations/products |
+| `get_listing_properties` | Get properties/variations for a listing |
+| `upload_listing_image` | Upload an image to a listing |
+| `delete_listing_image` | Delete an image from a listing |
 
-#### Listings
-- `list_listings` - List all active listings for a shop
-- `list_draft_listings` - List all draft listings for a shop
-- `get_listing` - Get details for a specific listing
-- `create_listing` - Create a new listing with optional custom variations (starts as draft)
-- `update_listing` - Update an existing listing (title, description, price, quantity, tags, materials, state, etc.)
-- `publish_listing` - Publish a draft listing (change state to active)
-- `deactivate_listing` - Deactivate a listing (change state to inactive)
-- `delete_listing` - Delete a listing permanently
-- `get_listing_inventory` - Get inventory details including variations/products
-- `update_listing_inventory` - Update inventory with variations/products
-- `get_listing_properties` - Get properties/variations for a listing
-- `upload_listing_image` - Upload an image to a listing
-- `delete_listing_image` - Delete an image from a listing
+### Shop Organization
+| Tool | Description |
+|---|---|
+| `get_shop_sections` | Get all shop sections (categories) |
+| `create_shop_section` | Create a new shop section (category) |
+| `get_shipping_profiles` | Get all shipping profiles for a shop |
 
-#### Shop Organization
-- `get_shop_sections` - Get all shop sections (categories)
-- `create_shop_section` - Create a new shop section (category)
-- `get_shipping_profiles` - Get all shipping profiles for a shop
-
-#### Orders & Fulfillment
-- `get_orders` - Get orders for a shop
-- `get_receipts` - Get receipts (order details) for a shop
-- `update_receipt` - Update receipt/order status (mark as shipped, paid, add tracking)
+### Orders & Fulfillment
+| Tool | Description |
+|---|---|
+| `get_orders` | Get orders for a shop |
+| `get_receipts` | Get receipts (order details) for a shop |
+| `update_receipt` | Update receipt/order status (shipped, paid, tracking) |
 
 ### Example Usage
 
@@ -204,7 +284,6 @@ update_listing_inventory({
     }
   ]
 })
-```
 
 // Update a listing
 update_listing({
@@ -279,14 +358,14 @@ The server communicates via stdio, so it's designed to be used with MCP-compatib
 
 ## MCP Client Configuration
 
-To use this server with Cursor IDE, add it to your MCP settings:
+To use this server with an MCP-compatible client, add it to your MCP settings, e.g. for Cursor:
 
 ```json
 {
   "mcpServers": {
     "etsy": {
       "command": "node",
-      "args": ["/path/to/etsy_mcp/dist/index.js"]
+      "args": ["/path/to/etsy-mcp/dist/index.js"]
     }
   }
 }
@@ -334,9 +413,8 @@ When creating a listing with variations:
 
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE).
 
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues or pull requests.
-
