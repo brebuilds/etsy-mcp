@@ -1,5 +1,7 @@
 # Etsy MCP Server
 
+[![CI](https://github.com/brebuilds/etsy-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/brebuilds/etsy-mcp/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI
 assistant (Claude, Cursor, or any MCP-compatible client) direct, tool-based access to
 the [Etsy Open API v3](https://developers.etsy.com/documentation/) — listing
